@@ -108,6 +108,14 @@ func setupTestRouter() {
 			bookings.PUT("/:id/checkin", middleware.AdminRequired(), handlers.CheckIn)
 		}
 
+		waitlist := api.Group("/waitlist")
+		waitlist.Use(middleware.AuthMiddleware())
+		{
+			waitlist.GET("/my", handlers.GetMyWaitlist)
+			waitlist.PUT("/:id/cancel", handlers.CancelWaitlist)
+			waitlist.GET("/schedule/:id", middleware.AdminRequired(), handlers.GetScheduleWaitlist)
+		}
+
 		stats := api.Group("/stats")
 		stats.Use(middleware.AuthMiddleware(), middleware.AdminRequired())
 		{
@@ -452,7 +460,7 @@ func Test22_CreateSchedule(t *testing.T) {
 	fmt.Println("✓ Create schedule passed, test schedule ID:", testScheduleID)
 }
 
-func Test23_FullCapacityRejected(t *testing.T) {
+func Test23_FullCapacityToWaitlist(t *testing.T) {
 	body := map[string]uint{"schedule_id": testScheduleID}
 	w1 := makeRequest("POST", "/api/bookings", body, memberToken)
 	assert.Equal(t, 201, w1.Code)
@@ -464,12 +472,180 @@ func Test23_FullCapacityRejected(t *testing.T) {
 	member2Token := resp2["token"].(string)
 
 	w3 := makeRequest("POST", "/api/bookings", body, member2Token)
-	assert.Equal(t, 400, w3.Code)
+	assert.Equal(t, 200, w3.Code)
 
 	var resp3 map[string]interface{}
 	parseResponse(w3, &resp3)
-	assert.Contains(t, resp3["error"], "满员")
-	fmt.Println("✓ Full capacity booking rejected")
+	assert.Equal(t, "课程已满，已加入候补队列", resp3["message"])
+	assert.Equal(t, "waitlist", resp3["queue_type"])
+	waitlistInfo := resp3["waitlist"].(map[string]interface{})
+	assert.Equal(t, float64(1), waitlistInfo["position"])
+	fmt.Println("✓ Full capacity joined waitlist with position 1")
+}
+
+func Test32_GetMyWaitlist(t *testing.T) {
+	member2LoginBody := map[string]string{"username": "member2", "password": "123456"}
+	w1 := makeRequest("POST", "/api/auth/login", member2LoginBody, "")
+	var resp1 map[string]interface{}
+	parseResponse(w1, &resp1)
+	member2Token := resp1["token"].(string)
+
+	w := makeRequest("GET", "/api/waitlist/my", nil, member2Token)
+	assert.Equal(t, 200, w.Code)
+
+	var resp map[string]interface{}
+	parseResponse(w, &resp)
+	waitlist := resp["waitlist"].([]interface{})
+	assert.GreaterOrEqual(t, len(waitlist), 1)
+	fmt.Println("✓ Get my waitlist passed")
+}
+
+func Test33_CancelAndPromoteWaitlist(t *testing.T) {
+	member2LoginBody := map[string]string{"username": "member2", "password": "123456"}
+	w1 := makeRequest("POST", "/api/auth/login", member2LoginBody, "")
+	var resp1 map[string]interface{}
+	parseResponse(w1, &resp1)
+	member2Token := resp1["token"].(string)
+
+	var cancelBookingID uint
+	var booking models.Booking
+	models.DB.Where("schedule_id = ? AND member_id = ? AND status = 'pending'", testScheduleID, uint(2)).First(&booking)
+	if booking.ID != 0 {
+		cancelBookingID = booking.ID
+	}
+	assert.NotZero(t, cancelBookingID, "member1 booking ID should not be zero")
+
+	w2 := makeRequest("PUT", fmt.Sprintf("/api/bookings/%d/cancel", cancelBookingID), nil, memberToken)
+	assert.Equal(t, 200, w2.Code)
+
+	var resp2 map[string]interface{}
+	parseResponse(w2, &resp2)
+	promoted := resp2["promoted"].(map[string]interface{})
+	assert.Equal(t, "已自动递补候补会员", promoted["message"])
+	assert.Equal(t, float64(3), promoted["member_id"])
+
+	w3 := makeRequest("GET", "/api/bookings/my", nil, member2Token)
+	var resp3 map[string]interface{}
+	parseResponse(w3, &resp3)
+	bookings := resp3["bookings"].([]interface{})
+	assert.GreaterOrEqual(t, len(bookings), 1)
+	promotedFound := false
+	for _, b := range bookings {
+		bm := b.(map[string]interface{})
+		if float64(testScheduleID) == bm["schedule_id"] && bm["status"] == "pending" {
+			promotedFound = true
+		}
+	}
+	assert.True(t, promotedFound, "member2 should now has a pending booking for the schedule")
+	fmt.Println("✓ Cancel auto promote waitlist passed")
+}
+
+func Test34_DuplicateWaitlistRejected(t *testing.T) {
+	startTime := time.Now().AddDate(0, 0, 3)
+	endTime := startTime.Add(time.Hour)
+	scheduleBody := map[string]interface{}{
+		"course_id":  1,
+		"coach_id":   1,
+		"start_time": startTime,
+		"end_time":   endTime,
+		"capacity":   1,
+		"room":       "重复候补测试房",
+	}
+	w0 := makeRequest("POST", "/api/schedules", scheduleBody, adminToken)
+	var resp0 map[string]interface{}
+	parseResponse(w0, &resp0)
+	newScheduleID := uint(resp0["schedule"].(map[string]interface{})["id"].(float64))
+
+	body := map[string]uint{"schedule_id": newScheduleID}
+	w1 := makeRequest("POST", "/api/bookings", body, memberToken)
+	assert.Equal(t, 201, w1.Code)
+
+	member2LoginBody := map[string]string{"username": "member2", "password": "123456"}
+	w2 := makeRequest("POST", "/api/auth/login", member2LoginBody, "")
+	var resp2 map[string]interface{}
+	parseResponse(w2, &resp2)
+	member2Token := resp2["token"].(string)
+
+	w3 := makeRequest("POST", "/api/bookings", body, member2Token)
+	assert.Equal(t, 200, w3.Code)
+	var resp3 map[string]interface{}
+	parseResponse(w3, &resp3)
+	assert.Equal(t, "课程已满，已加入候补队列", resp3["message"])
+
+	w4 := makeRequest("POST", "/api/bookings", body, member2Token)
+	assert.Equal(t, 400, w4.Code)
+	var resp4 map[string]interface{}
+	parseResponse(w4, &resp4)
+	assert.Contains(t, resp4["error"], "候补队列")
+	fmt.Println("✓ Duplicate waitlist rejected")
+}
+
+func Test35_CancelWaitlist(t *testing.T) {
+	startTime := time.Now().AddDate(0, 0, 2)
+	endTime := startTime.Add(time.Hour)
+	scheduleBody := map[string]interface{}{
+		"course_id":  1,
+		"coach_id":   1,
+		"start_time": startTime,
+		"end_time":   endTime,
+		"capacity":   1,
+		"room":       "候补测试房2",
+	}
+	w1 := makeRequest("POST", "/api/schedules", scheduleBody, adminToken)
+	var resp1 map[string]interface{}
+	parseResponse(w1, &resp1)
+	newScheduleID := uint(resp1["schedule"].(map[string]interface{})["id"].(float64))
+
+	body := map[string]uint{"schedule_id": newScheduleID}
+	w2 := makeRequest("POST", "/api/bookings", body, memberToken)
+	assert.Equal(t, 201, w2.Code)
+
+	member2LoginBody := map[string]string{"username": "member2", "password": "123456"}
+	w3 := makeRequest("POST", "/api/auth/login", member2LoginBody, "")
+	var resp3 map[string]interface{}
+	parseResponse(w3, &resp3)
+	member2Token := resp3["token"].(string)
+
+	w4 := makeRequest("POST", "/api/bookings", body, member2Token)
+	assert.Equal(t, 200, w4.Code)
+	var resp4 map[string]interface{}
+	parseResponse(w4, &resp4)
+	waitlistInfo := resp4["waitlist"].(map[string]interface{})
+	waitlistID := uint(waitlistInfo["id"].(float64))
+
+	w5 := makeRequest("PUT", fmt.Sprintf("/api/waitlist/%d/cancel", waitlistID), nil, member2Token)
+	assert.Equal(t, 200, w5.Code)
+	var resp5 map[string]interface{}
+	parseResponse(w5, &resp5)
+	assert.Equal(t, "取消候补成功", resp5["message"])
+
+	w6 := makeRequest("GET", "/api/waitlist/my", nil, member2Token)
+	var resp6 map[string]interface{}
+	parseResponse(w6, &resp6)
+	fmt.Println("✓ Cancel waitlist passed")
+}
+
+func Test36_GetScheduleWaitlist(t *testing.T) {
+	w := makeRequest("GET", fmt.Sprintf("/api/waitlist/schedule/%d", testScheduleID), nil, adminToken)
+	assert.Equal(t, 200, w.Code)
+
+	var resp map[string]interface{}
+	parseResponse(w, &resp)
+	assert.NotNil(t, resp["count"])
+	fmt.Println("✓ Get schedule waitlist passed, count:", resp["count"])
+}
+
+func Test37_ScheduleDetailWithWaitlist(t *testing.T) {
+	w := makeRequest("GET", fmt.Sprintf("/api/schedules/%d/bookings", testScheduleID), nil, adminToken)
+	assert.Equal(t, 200, w.Code)
+
+	var resp map[string]interface{}
+	parseResponse(w, &resp)
+	schedule := resp["schedule"].(map[string]interface{})
+	assert.NotNil(t, schedule["waitlist_count"])
+	_, waitlistExists := resp["waitlist"]
+	assert.True(t, waitlistExists)
+	fmt.Println("✓ Schedule detail with waitlist passed")
 }
 
 func Test24_UserRegistration(t *testing.T) {

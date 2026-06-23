@@ -86,6 +86,14 @@ func main() {
 			bookings.PUT("/:id/checkin", middleware.AdminRequired(), handlers.CheckIn)
 		}
 
+		waitlist := api.Group("/waitlist")
+		waitlist.Use(middleware.AuthMiddleware())
+		{
+			waitlist.GET("/my", handlers.GetMyWaitlist)
+			waitlist.PUT("/:id/cancel", handlers.CancelWaitlist)
+			waitlist.GET("/schedule/:id", middleware.AdminRequired(), handlers.GetScheduleWaitlist)
+		}
+
 		stats := api.Group("/stats")
 		stats.Use(middleware.AuthMiddleware(), middleware.AdminRequired())
 		{

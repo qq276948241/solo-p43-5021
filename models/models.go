@@ -84,6 +84,30 @@ type Booking struct {
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
+type Waitlist struct {
+	ID         uint      `gorm:"primaryKey" json:"id"`
+	ScheduleID uint      `gorm:"not null;index" json:"schedule_id"`
+	Schedule   Schedule  `gorm:"foreignKey:ScheduleID" json:"schedule,omitempty"`
+	MemberID   uint      `gorm:"not null;index" json:"member_id"`
+	Member     User      `gorm:"foreignKey:MemberID" json:"member,omitempty"`
+	Position   int       `gorm:"not null;default:0" json:"position"`
+	Status     string    `gorm:"size:20;not null;default:waiting;index" json:"status"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+const (
+	WaitlistStatusWaiting = "waiting"
+	WaitlistStatusPromoted = "promoted"
+	WaitlistStatusCanceled = "canceled"
+)
+
+func (s *Schedule) WaitlistCount() int {
+	var count int64
+	DB.Model(&Waitlist{}).Where("schedule_id = ? AND status = ?", s.ID, WaitlistStatusWaiting).Count(&count)
+	return int(count)
+}
+
 type WeeklyAttendance struct {
 	WeekStart   time.Time `json:"week_start"`
 	CourseName  string    `json:"course_name"`
