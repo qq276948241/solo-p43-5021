@@ -1,18 +1,24 @@
 package handlers
 
 import (
-	"fitness-studio-api/config"
 	"fitness-studio-api/middleware"
-	"fitness-studio-api/models"
+	"fitness-studio-api/service"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 type BookingRequest struct {
 	ScheduleID uint `json:"schedule_id" binding:"required"`
+}
+
+func handleServiceError(c *gin.Context, svcErr *service.ServiceError) {
+	resp := gin.H{"error": svcErr.Message}
+	for k, v := range svcErr.Data {
+		resp[k] = v
+	}
+	c.JSON(svcErr.Status, resp)
 }
 
 func CreateBooking(c *gin.Context) {
@@ -24,272 +30,112 @@ func CreateBooking(c *gin.Context) {
 		return
 	}
 
-	var member models.User
-	if err := models.DB.Where("id = ? AND role = ?", memberID, config.RoleMember).First(&member).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "会员不存在"})
+	result, svcErr := service.CreateBooking(memberID, req.ScheduleID)
+	if svcErr != nil {
+		handleServiceError(c, svcErr)
 		return
 	}
 
-	if member.MembershipStatus() == config.MembershipStatusExpired {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "会员已过期，请先续费后再预约课程",
-			"membership_expire_at": member.MembershipExpireAt,
-		})
-		return
-	}
-
-	var schedule models.Schedule
-	if err := models.DB.Preload("Course").Preload("Coach").First(&schedule, req.ScheduleID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "课程排期不存在"})
-		return
-	}
-
-	if schedule.StartTime.Before(time.Now()) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "该课程已开始，无法预约"})
-		return
-	}
-
-	var existingBooking models.Booking
-	if err := models.DB.Where("schedule_id = ? AND member_id = ? AND status != ?",
-		req.ScheduleID, memberID, config.BookingStatusCanceled).First(&existingBooking).Error; err == nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "您已预约该课程，无需重复预约"})
-		return
-	}
-
-	var existingWaitlist models.Waitlist
-	if err := models.DB.Where("schedule_id = ? AND member_id = ? AND status = ?",
-		req.ScheduleID, memberID, models.WaitlistStatusWaiting).First(&existingWaitlist).Error; err == nil {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "您已在候补队列中",
-			"position": existingWaitlist.Position,
-			"queue_type": "waitlist",
-		})
-		return
-	}
-
-	bookedCount := schedule.BookedCount()
-	if bookedCount >= schedule.Capacity {
-		waitlistCount := schedule.WaitlistCount()
-		position := waitlistCount + 1
-
-		waitlist := models.Waitlist{
-			ScheduleID: req.ScheduleID,
-			MemberID:   memberID,
-			Position:   position,
-			Status:     models.WaitlistStatusWaiting,
-		}
-		if err := models.DB.Create(&waitlist).Error; err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "候补失败: " + err.Error()})
-			return
-		}
-
+	if result.IsWaitlist {
 		c.JSON(http.StatusOK, gin.H{
-			"message": "课程已满，已加入候补队列",
+			"message":    "课程已满，已加入候补队列",
 			"queue_type": "waitlist",
 			"waitlist": gin.H{
-				"id":           waitlist.ID,
-				"schedule_id":  waitlist.ScheduleID,
-				"course_name":  schedule.Course.Name,
-				"coach_name":   schedule.Coach.Name,
-				"start_time":   schedule.StartTime,
-				"position":     position,
-				"total_waiting": waitlistCount,
-				"status":       waitlist.Status,
-				"created_at":   waitlist.CreatedAt,
+				"id":            result.Waitlist.ID,
+				"schedule_id":   result.Waitlist.ScheduleID,
+				"course_name":   result.Schedule.Course.Name,
+				"coach_name":    result.Schedule.Coach.Name,
+				"start_time":    result.Schedule.StartTime,
+				"position":      result.Position,
+				"total_waiting": result.TotalWaiting,
+				"status":        result.Waitlist.Status,
+				"created_at":    result.Waitlist.CreatedAt,
 			},
 			"note": "有人取消预约时，将按候补顺序自动递补",
 		})
 		return
 	}
 
-	booking := models.Booking{
-		ScheduleID: req.ScheduleID,
-		MemberID:   memberID,
-		Status:     config.BookingStatusPending,
-	}
-
-	if err := models.DB.Create(&booking).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "预约失败: " + err.Error()})
-		return
-	}
-
-	booking.Schedule = schedule
-	booking.Member = member
-
 	c.JSON(http.StatusCreated, gin.H{
 		"message": "预约成功",
 		"booking": gin.H{
-			"id":           booking.ID,
-			"schedule_id":  booking.ScheduleID,
-			"course_name":  schedule.Course.Name,
-			"coach_name":   schedule.Coach.Name,
-			"start_time":   schedule.StartTime,
-			"end_time":     schedule.EndTime,
-			"room":         schedule.Room,
-			"status":       booking.Status,
-			"created_at":   booking.CreatedAt,
+			"id":           result.Booking.ID,
+			"schedule_id":  result.Booking.ScheduleID,
+			"course_name":  result.Schedule.Course.Name,
+			"coach_name":   result.Schedule.Coach.Name,
+			"start_time":   result.Schedule.StartTime,
+			"end_time":     result.Schedule.EndTime,
+			"room":         result.Schedule.Room,
+			"status":       result.Booking.Status,
+			"created_at":   result.Booking.CreatedAt,
 		},
 	})
-}
-
-func promoteWaitlistToBooking(scheduleID uint) (*models.Booking, *models.Waitlist, error) {
-	var waitlist models.Waitlist
-	if err := models.DB.Where("schedule_id = ? AND status = ?", scheduleID, models.WaitlistStatusWaiting).
-		Order("position ASC").First(&waitlist).Error; err != nil {
-		return nil, nil, err
-	}
-
-	waitlist.Status = models.WaitlistStatusPromoted
-	models.DB.Save(&waitlist)
-
-	booking := models.Booking{
-		ScheduleID: scheduleID,
-		MemberID:   waitlist.MemberID,
-		Status:     config.BookingStatusPending,
-	}
-	if err := models.DB.Create(&booking).Error; err != nil {
-		return nil, nil, err
-	}
-
-	var remaining []models.Waitlist
-	models.DB.Where("schedule_id = ? AND status = ? AND id != ?", scheduleID, models.WaitlistStatusWaiting, waitlist.ID).
-		Order("position ASC").Find(&remaining)
-	for i, w := range remaining {
-		w.Position = i + 1
-		models.DB.Save(&w)
-	}
-
-	models.DB.Preload("Member").First(&waitlist, waitlist.ID)
-	return &booking, &waitlist, nil
 }
 
 func CancelBooking(c *gin.Context) {
 	memberID := middleware.GetCurrentUserID(c)
 	role := middleware.GetCurrentUserRole(c)
 
-	idParam := c.Param("id")
-	id, err := strconv.ParseUint(idParam, 10, 32)
+	id, err := service.ParseUintParam(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的预约ID"})
 		return
 	}
 
-	var booking models.Booking
-	query := models.DB.Preload("Schedule").Preload("Schedule.Course").Where("id = ?", uint(id))
-	if role != config.RoleAdmin {
-		query = query.Where("member_id = ?", memberID)
-	}
-
-	if err := query.First(&booking).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "预约不存在或无权限取消"})
+	result, svcErr := service.CancelBooking(id, memberID, role)
+	if svcErr != nil {
+		handleServiceError(c, svcErr)
 		return
 	}
-
-	if booking.Status == config.BookingStatusCanceled {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "该预约已取消，无需重复操作"})
-		return
-	}
-
-	if booking.Schedule.StartTime.Before(time.Now()) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "课程已开始，无法取消预约"})
-		return
-	}
-
-	booking.Status = config.BookingStatusCanceled
-	models.DB.Save(&booking)
 
 	response := gin.H{
 		"message": "取消预约成功",
 		"booking": gin.H{
-			"id":          booking.ID,
-			"course_name": booking.Schedule.Course.Name,
-			"start_time":  booking.Schedule.StartTime,
-			"status":      booking.Status,
+			"id":          result.Booking.ID,
+			"course_name": result.Booking.Schedule.Course.Name,
+			"start_time":  result.Booking.Schedule.StartTime,
+			"status":      result.Booking.Status,
 		},
 	}
 
-	promotedBooking, promotedWaitlist, promoteErr := promoteWaitlistToBooking(booking.ScheduleID)
-	if promoteErr == nil && promotedBooking != nil {
-		var promotedMember models.User
-		models.DB.First(&promotedMember, promotedBooking.MemberID)
+	if result.PromotedBooking != nil {
 		response["promoted"] = gin.H{
-			"message": "已自动递补候补会员",
-			"member_id":   promotedBooking.MemberID,
-			"member_name": promotedMember.Name,
-			"new_booking_id": promotedBooking.ID,
-			"waitlist_id": promotedWaitlist.ID,
-			"was_position": promotedWaitlist.Position,
+			"message":        "已自动递补候补会员",
+			"member_id":      result.PromotedBooking.MemberID,
+			"member_name":    result.PromotedMember.Name,
+			"new_booking_id": result.PromotedBooking.ID,
+			"waitlist_id":    result.PromotedWaitlist.ID,
+			"was_position":   result.PromotedWaitlist.Position,
 		}
-
-		var remainingWaitlist []models.Waitlist
-		models.DB.Where("schedule_id = ? AND status = ?", booking.ScheduleID, models.WaitlistStatusWaiting).
-			Order("position ASC").Find(&remainingWaitlist)
-		response["remaining_waitlist"] = len(remainingWaitlist)
+		response["remaining_waitlist"] = result.RemainingWaitlist
 	}
 
 	c.JSON(http.StatusOK, response)
 }
 
 func CheckIn(c *gin.Context) {
-	idParam := c.Param("id")
-	id, err := strconv.ParseUint(idParam, 10, 32)
+	id, err := service.ParseUintParam(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的预约ID"})
 		return
 	}
 
-	var booking models.Booking
-	if err := models.DB.Preload("Schedule").Preload("Schedule.Course").Preload("Member").First(&booking, uint(id)).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "预约不存在"})
+	result, svcErr := service.CheckIn(id)
+	if svcErr != nil {
+		handleServiceError(c, svcErr)
 		return
 	}
 
-	if booking.Status == config.BookingStatusCanceled {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "该预约已取消，无法签到"})
-		return
-	}
-
-	if booking.Status == config.BookingStatusChecked {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "该预约已签到，无需重复签到"})
-		return
-	}
-
-	now := time.Now()
-	startTime := booking.Schedule.StartTime
-	endTime := booking.Schedule.EndTime
-
-	if now.Before(startTime.Add(-30 * time.Minute)) {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "签到时间未到，请在课程开始前30分钟内签到",
-			"start_time": startTime,
-			"current_time": now,
-		})
-		return
-	}
-
-	if now.After(endTime) {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "课程已结束，无法签到",
-			"end_time": endTime,
-			"current_time": now,
-		})
-		return
-	}
-
-	nowPtr := now
-	booking.Status = config.BookingStatusChecked
-	booking.CheckedAt = &nowPtr
-	models.DB.Save(&booking)
-
+	b := result.Booking
 	c.JSON(http.StatusOK, gin.H{
 		"message": "签到成功",
 		"booking": gin.H{
-			"id":           booking.ID,
-			"member_name":  booking.Member.Name,
-			"course_name":  booking.Schedule.Course.Name,
-			"start_time":   booking.Schedule.StartTime,
-			"checked_at":   booking.CheckedAt,
-			"status":       booking.Status,
+			"id":           b.ID,
+			"member_name":  b.Member.Name,
+			"course_name":  b.Schedule.Course.Name,
+			"start_time":   b.Schedule.StartTime,
+			"checked_at":   b.CheckedAt,
+			"status":       b.Status,
 		},
 	})
 }
@@ -298,35 +144,11 @@ func GetMyBookings(c *gin.Context) {
 	memberID := middleware.GetCurrentUserID(c)
 	status := c.Query("status")
 
-	query := models.DB.Preload("Schedule").Preload("Schedule.Course").Preload("Schedule.Coach").
-		Where("member_id = ?", memberID)
-
-	if status != "" {
-		query = query.Where("status = ?", status)
-	}
-
-	var bookings []models.Booking
-	query.Order("created_at DESC").Find(&bookings)
-
-	var result []gin.H
-	for _, b := range bookings {
-		result = append(result, gin.H{
-			"id":           b.ID,
-			"schedule_id":  b.ScheduleID,
-			"course_name":  b.Schedule.Course.Name,
-			"coach_name":   b.Schedule.Coach.Name,
-			"start_time":   b.Schedule.StartTime,
-			"end_time":     b.Schedule.EndTime,
-			"room":         b.Schedule.Room,
-			"status":       b.Status,
-			"checked_at":   b.CheckedAt,
-			"created_at":   b.CreatedAt,
-		})
-	}
+	bookings := service.GetMyBookings(memberID, status)
 
 	c.JSON(http.StatusOK, gin.H{
-		"count":   len(result),
-		"bookings": result,
+		"count":    len(bookings),
+		"bookings": bookings,
 	})
 }
 
@@ -337,144 +159,44 @@ func GetBookingList(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
 
-	offset := (page - 1) * pageSize
-
-	query := models.DB.Preload("Schedule").Preload("Schedule.Course").Preload("Member").Model(&models.Booking{})
-
-	if scheduleID != "" {
-		query = query.Where("schedule_id = ?", scheduleID)
-	}
-	if memberID != "" {
-		query = query.Where("member_id = ?", memberID)
-	}
-	if status != "" {
-		query = query.Where("status = ?", status)
-	}
-
-	var total int64
-	query.Count(&total)
-
-	var bookings []models.Booking
-	query.Offset(offset).Limit(pageSize).Order("created_at DESC").Find(&bookings)
-
-	var result []gin.H
-	for _, b := range bookings {
-		result = append(result, gin.H{
-			"id":           b.ID,
-			"schedule_id":  b.ScheduleID,
-			"course_name":  b.Schedule.Course.Name,
-			"member_id":    b.MemberID,
-			"member_name":  b.Member.Name,
-			"start_time":   b.Schedule.StartTime,
-			"status":       b.Status,
-			"checked_at":   b.CheckedAt,
-			"created_at":   b.CreatedAt,
-		})
-	}
+	result := service.GetBookingList(scheduleID, memberID, status, page, pageSize)
 
 	c.JSON(http.StatusOK, gin.H{
-		"total":     total,
-		"page":      page,
-		"page_size": pageSize,
-		"bookings":  result,
+		"total":     result.Total,
+		"page":      result.Page,
+		"page_size": result.PageSize,
+		"bookings":  result.Bookings,
 	})
 }
 
 func GetScheduleBookings(c *gin.Context) {
-	scheduleIDParam := c.Param("id")
-	scheduleID, err := strconv.ParseUint(scheduleIDParam, 10, 32)
+	scheduleID, err := service.ParseUintParam(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的排课ID"})
 		return
 	}
 
-	var schedule models.Schedule
-	if err := models.DB.Preload("Course").Preload("Coach").First(&schedule, uint(scheduleID)).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "排课不存在"})
+	result, svcErr := service.GetScheduleBookings(scheduleID)
+	if svcErr != nil {
+		handleServiceError(c, svcErr)
 		return
 	}
 
-	var bookings []models.Booking
-	models.DB.Preload("Member").Where("schedule_id = ? AND status != ?", uint(scheduleID), config.BookingStatusCanceled).
-		Order("created_at ASC").Find(&bookings)
-
-	var waitlist []models.Waitlist
-	models.DB.Preload("Member").Where("schedule_id = ? AND status = ?", uint(scheduleID), models.WaitlistStatusWaiting).
-		Order("position ASC").Find(&waitlist)
-
-	var memberList []gin.H
-	checkedCount := 0
-	for _, b := range bookings {
-		if b.Status == config.BookingStatusChecked {
-			checkedCount++
-		}
-		memberList = append(memberList, gin.H{
-			"booking_id":  b.ID,
-			"member_id":   b.MemberID,
-			"member_name": b.Member.Name,
-			"phone":       b.Member.Phone,
-			"status":      b.Status,
-			"checked_at":  b.CheckedAt,
-			"booked_at":   b.CreatedAt,
-		})
-	}
-
-	var waitlistList []gin.H
-	for _, w := range waitlist {
-		waitlistList = append(waitlistList, gin.H{
-			"waitlist_id": w.ID,
-			"member_id":   w.MemberID,
-			"member_name": w.Member.Name,
-			"phone":       w.Member.Phone,
-			"position":    w.Position,
-			"status":      w.Status,
-			"created_at":  w.CreatedAt,
-		})
-	}
-
 	c.JSON(http.StatusOK, gin.H{
-		"schedule": gin.H{
-			"id":            schedule.ID,
-			"course_name":   schedule.Course.Name,
-			"coach_name":    schedule.Coach.Name,
-			"start_time":    schedule.StartTime,
-			"end_time":      schedule.EndTime,
-			"capacity":      schedule.Capacity,
-			"booked_count":  len(bookings),
-			"waitlist_count": len(waitlist),
-			"checked_count": checkedCount,
-			"room":          schedule.Room,
-		},
-		"members": memberList,
-		"waitlist": waitlistList,
+		"schedule": result.Schedule,
+		"members":  result.Members,
+		"waitlist": result.Waitlist,
 	})
 }
 
 func GetMyWaitlist(c *gin.Context) {
 	memberID := middleware.GetCurrentUserID(c)
 
-	var waitlist []models.Waitlist
-	models.DB.Preload("Schedule").Preload("Schedule.Course").Preload("Schedule.Coach").
-		Where("member_id = ?", memberID).
-		Order("created_at DESC").Find(&waitlist)
-
-	var result []gin.H
-	for _, w := range waitlist {
-		result = append(result, gin.H{
-			"id":          w.ID,
-			"schedule_id": w.ScheduleID,
-			"course_name": w.Schedule.Course.Name,
-			"coach_name":  w.Schedule.Coach.Name,
-			"start_time":  w.Schedule.StartTime,
-			"position":    w.Position,
-			"status":      w.Status,
-			"created_at":  w.CreatedAt,
-		})
-	}
+	waitlist := service.GetMyWaitlist(memberID)
 
 	c.JSON(http.StatusOK, gin.H{
-		"count":    len(result),
-		"waitlist": result,
+		"count":    len(waitlist),
+		"waitlist": waitlist,
 	})
 }
 
@@ -482,86 +204,40 @@ func CancelWaitlist(c *gin.Context) {
 	memberID := middleware.GetCurrentUserID(c)
 	role := middleware.GetCurrentUserRole(c)
 
-	idParam := c.Param("id")
-	id, err := strconv.ParseUint(idParam, 10, 32)
+	id, err := service.ParseUintParam(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的候补ID"})
 		return
 	}
 
-	var waitlist models.Waitlist
-	query := models.DB.Preload("Schedule").Where("id = ?", uint(id))
-	if role != config.RoleAdmin {
-		query = query.Where("member_id = ?", memberID)
-	}
-
-	if err := query.First(&waitlist).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "候补记录不存在或无权限取消"})
+	result, svcErr := service.CancelWaitlist(id, memberID, role)
+	if svcErr != nil {
+		handleServiceError(c, svcErr)
 		return
-	}
-
-	if waitlist.Status != models.WaitlistStatusWaiting {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "该候补无法取消",
-			"current_status": waitlist.Status,
-		})
-		return
-	}
-
-	if waitlist.Schedule.StartTime.Before(time.Now()) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "课程已开始，无法取消候补"})
-		return
-	}
-
-	waitlist.Status = models.WaitlistStatusCanceled
-	models.DB.Save(&waitlist)
-
-	var remaining []models.Waitlist
-	models.DB.Where("schedule_id = ? AND status = ?", waitlist.ScheduleID, models.WaitlistStatusWaiting).
-		Order("position ASC").Find(&remaining)
-	for i, w := range remaining {
-		w.Position = i + 1
-		models.DB.Save(&w)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "取消候补成功",
 		"waitlist": gin.H{
-			"id":          waitlist.ID,
-			"schedule_id": waitlist.ScheduleID,
-			"status":      waitlist.Status,
+			"id":          result.Waitlist.ID,
+			"schedule_id": result.Waitlist.ScheduleID,
+			"status":      result.Waitlist.Status,
 		},
-		"remaining_waitlist": len(remaining),
+		"remaining_waitlist": result.RemainingWaitlist,
 	})
 }
 
 func GetScheduleWaitlist(c *gin.Context) {
-	scheduleIDParam := c.Param("id")
-	scheduleID, err := strconv.ParseUint(scheduleIDParam, 10, 32)
+	scheduleID, err := service.ParseUintParam(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的排课ID"})
 		return
 	}
 
-	var waitlist []models.Waitlist
-	models.DB.Preload("Member").Where("schedule_id = ? AND status = ?", uint(scheduleID), models.WaitlistStatusWaiting).
-		Order("position ASC").Find(&waitlist)
-
-	var result []gin.H
-	for _, w := range waitlist {
-		result = append(result, gin.H{
-			"waitlist_id": w.ID,
-			"member_id":   w.MemberID,
-			"member_name": w.Member.Name,
-			"phone":       w.Member.Phone,
-			"position":    w.Position,
-			"status":      w.Status,
-			"created_at":  w.CreatedAt,
-		})
-	}
+	waitlist := service.GetScheduleWaitlist(scheduleID)
 
 	c.JSON(http.StatusOK, gin.H{
-		"count":    len(result),
-		"waitlist": result,
+		"count":    len(waitlist),
+		"waitlist": waitlist,
 	})
 }
